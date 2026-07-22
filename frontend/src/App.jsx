@@ -21,9 +21,27 @@ import {
   FileSpreadsheet
 } from 'lucide-react';
 
+const decodeJwt = (token) => {
+  try {
+    const base64Url = token.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+    }).join(''));
+    return JSON.parse(jsonPayload);
+  } catch (e) {
+    return null;
+  }
+};
+
 export default function App() {
   // Navigation
   const [activeTab, setActiveTab] = useState('home');
+
+  // Auth state
+  const [authConfig, setAuthConfig] = useState({ users_mode: "2", google_client_id: "", auth_enabled: false });
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userProfile, setUserProfile] = useState(null);
 
   // Backend Connection
   const [backendUrl, setBackendUrl] = useState(() => {
@@ -64,6 +82,79 @@ export default function App() {
 
   const terminalEndRef = useRef(null);
 
+  // Helper to construct Authorization header
+  const getHeaders = (extraHeaders = {}) => {
+    const token = localStorage.getItem('naukri_bot_google_token');
+    return {
+      'Content-Type': 'application/json',
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...extraHeaders
+    };
+  };
+
+  // Fetch auth config on startup
+  const fetchAuthConfig = async () => {
+    try {
+      const cleanUrl = backendUrl.replace(/\/$/, '');
+      const response = await fetch(`${cleanUrl}/api/auth-config`);
+      if (response.ok) {
+        const data = await response.json();
+        setAuthConfig(data);
+        
+        if (data.auth_enabled) {
+          const token = localStorage.getItem('naukri_bot_google_token');
+          if (token) {
+            const decoded = decodeJwt(token);
+            if (decoded && decoded.exp * 1000 > Date.now()) {
+              setUserProfile(decoded);
+              setIsAuthenticated(true);
+              return { auth_enabled: true, authenticated: true };
+            } else {
+              localStorage.removeItem('naukri_bot_google_token');
+            }
+          }
+          setIsAuthenticated(false);
+          return { auth_enabled: true, authenticated: false };
+        } else {
+          setIsAuthenticated(true); // Bypass auth
+          return { auth_enabled: false, authenticated: true };
+        }
+      }
+    } catch (err) {
+      console.error('Error fetching auth config:', err);
+    }
+    return { auth_enabled: false, authenticated: false };
+  };
+
+  // Handle successful Google login
+  const handleGoogleLoginSuccess = (response) => {
+    const token = response.credential;
+    const decoded = decodeJwt(token);
+    if (decoded) {
+      localStorage.setItem('naukri_bot_google_token', token);
+      setUserProfile(decoded);
+      setIsAuthenticated(true);
+      checkConnection(true).then((connected) => {
+        if (connected) {
+          fetchStatus();
+          fetchConfig();
+          fetchResults();
+          fetchLogs();
+        }
+      });
+    } else {
+      alert('Failed to parse Google Login token.');
+    }
+  };
+
+  // Handle logout
+  const handleLogout = () => {
+    localStorage.removeItem('naukri_bot_google_token');
+    setIsAuthenticated(false);
+    setUserProfile(null);
+    setActiveTab('home');
+  };
+
   // Save backendUrl to localStorage when changed
   const handleBackendUrlChange = (e) => {
     const val = e.target.value.trim();
@@ -75,7 +166,10 @@ export default function App() {
   const checkConnection = async (showLogs = false) => {
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/status`, { signal: AbortSignal.timeout(3000) });
+      const response = await fetch(`${cleanUrl}/api/status`, { 
+        headers: getHeaders(),
+        signal: AbortSignal.timeout(3000) 
+      });
       if (response.ok) {
         setIsConnected(true);
         setConnectionError('');
@@ -97,7 +191,7 @@ export default function App() {
     if (!backendUrl) return;
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/status`);
+      const response = await fetch(`${cleanUrl}/api/status`, { headers: getHeaders() });
       if (response.ok) {
         const data = await response.json();
         setIsRunning(data.running);
@@ -117,7 +211,7 @@ export default function App() {
     if (!isConnected) return;
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/logs?lines=150`);
+      const response = await fetch(`${cleanUrl}/api/logs?lines=150`, { headers: getHeaders() });
       if (response.ok) {
         const data = await response.json();
         setLogs(data.logs);
@@ -132,7 +226,7 @@ export default function App() {
     if (!isConnected) return;
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/results`);
+      const response = await fetch(`${cleanUrl}/api/results`, { headers: getHeaders() });
       if (response.ok) {
         const data = await response.json();
         setResults(data);
@@ -147,7 +241,7 @@ export default function App() {
     if (!isConnected) return;
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/config`);
+      const response = await fetch(`${cleanUrl}/api/config`, { headers: getHeaders() });
       if (response.ok) {
         const data = await response.json();
         setConfig(data);
@@ -168,7 +262,7 @@ export default function App() {
       const cleanUrl = backendUrl.replace(/\/$/, '');
       const response = await fetch(`${cleanUrl}/api/config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getHeaders(),
         body: JSON.stringify({ settings: config })
       });
       if (response.ok) {
@@ -189,7 +283,10 @@ export default function App() {
     if (!isConnected) return;
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/start`, { method: 'POST' });
+      const response = await fetch(`${cleanUrl}/api/start`, { 
+        method: 'POST',
+        headers: getHeaders()
+      });
       if (response.ok) {
         setIsRunning(true);
         setLogs('Starting Naukri bot run in background...\n');
@@ -209,7 +306,10 @@ export default function App() {
     if (!isConnected) return;
     try {
       const cleanUrl = backendUrl.replace(/\/$/, '');
-      const response = await fetch(`${cleanUrl}/api/stop`, { method: 'POST' });
+      const response = await fetch(`${cleanUrl}/api/stop`, { 
+        method: 'POST',
+        headers: getHeaders()
+      });
       if (response.ok) {
         fetchStatus();
         fetchLogs();
@@ -259,29 +359,63 @@ export default function App() {
     handleConfigChange(configKey, updatedTags);
   };
 
-  // Poll status, logs, and results
+  // Fetch auth config on mount, then connection check
   useEffect(() => {
-    // Initial verification
-    checkConnection(true).then((connected) => {
-      if (connected) {
-        fetchStatus();
-        fetchConfig();
-        fetchResults();
-        fetchLogs();
+    fetchAuthConfig().then((authStatus) => {
+      if (!authStatus || !authStatus.auth_enabled || authStatus.authenticated) {
+        checkConnection(true).then((connected) => {
+          if (connected) {
+            fetchStatus();
+            fetchConfig();
+            fetchResults();
+            fetchLogs();
+          }
+        });
       }
     });
 
     // Setup polling
     const interval = setInterval(() => {
-      fetchStatus();
-      if (isRunning) {
-        fetchLogs();
-        fetchResults();
+      const token = localStorage.getItem('naukri_bot_google_token');
+      const isAuth = !authConfig.auth_enabled || (token && decodeJwt(token)?.exp * 1000 > Date.now());
+      if (isAuth) {
+        fetchStatus();
+        if (isRunning) {
+          fetchLogs();
+          fetchResults();
+        }
       }
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [backendUrl, isRunning]);
+  }, [backendUrl, isRunning, authConfig.auth_enabled]);
+
+  // Handle initialization of Google Sign-in button
+  useEffect(() => {
+    if (authConfig.auth_enabled && !isAuthenticated && authConfig.google_client_id) {
+      const initGsi = () => {
+        if (window.google) {
+          window.google.accounts.id.initialize({
+            client_id: authConfig.google_client_id,
+            callback: handleGoogleLoginSuccess,
+          });
+          window.google.accounts.id.renderButton(
+            document.getElementById('google-signin-btn'),
+            { theme: 'filled_black', size: 'large', width: '280' }
+          );
+        }
+      };
+
+      if (window.google) {
+        initGsi();
+      } else {
+        const script = document.querySelector('script[src="https://accounts.google.com/gsi/client"]');
+        if (script) {
+          script.addEventListener('load', initGsi);
+        }
+      }
+    }
+  }, [authConfig, isAuthenticated]);
 
   // Scroll terminal logs to bottom on update
   useEffect(() => {
@@ -344,6 +478,38 @@ export default function App() {
     ? Math.round(((stats.applied + stats.already_applied) / stats.total) * 100)
     : 0;
 
+  if (authConfig.auth_enabled && !isAuthenticated) {
+    return (
+      <div className="login-container" style={{
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: 'center',
+        alignItems: 'center',
+        height: '100vh',
+        backgroundColor: '#0f172a',
+        color: '#fff',
+        fontFamily: 'system-ui, sans-serif'
+      }}>
+        <div className="login-card" style={{
+          padding: '40px',
+          borderRadius: '16px',
+          backgroundColor: '#1e293b',
+          boxShadow: '0 4px 30px rgba(0, 0, 0, 0.5)',
+          border: '1px solid #334155',
+          textAlign: 'center',
+          maxWidth: '400px',
+          width: '100%'
+        }}>
+          <h1 style={{ fontSize: '32px', marginBottom: '8px', color: '#6366f1' }}>Naukri Ease</h1>
+          <p style={{ color: '#94a3b8', marginBottom: '32px' }}>Login with your Google Account to manage settings and control your bots.</p>
+          <div style={{ display: 'flex', justifyContent: 'center' }}>
+            <div id="google-signin-btn"></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app-container">
       {/* Sidebar Navigation */}
@@ -387,6 +553,49 @@ export default function App() {
             </li>
           </ul>
         </nav>
+
+        {isAuthenticated && userProfile && (
+          <div className="user-profile-panel" style={{
+            padding: '12px',
+            borderTop: '1px solid #334155',
+            borderBottom: '1px solid #334155',
+            marginTop: 'auto',
+            marginBottom: '12px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px'
+          }}>
+            {userProfile.picture && (
+              <img 
+                src={userProfile.picture} 
+                alt="Profile" 
+                style={{ width: '32px', height: '32px', borderRadius: '50%' }} 
+              />
+            )}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {userProfile.name}
+              </div>
+              <div style={{ fontSize: '10px', color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {userProfile.email}
+              </div>
+            </div>
+            <button 
+              onClick={handleLogout}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#ef4444',
+                cursor: 'pointer',
+                fontSize: '11px',
+                padding: '4px'
+              }}
+              title="Logout"
+            >
+              Logout
+            </button>
+          </div>
+        )}
 
         {/* Connection status footer panel */}
         <div className="connection-status-panel">

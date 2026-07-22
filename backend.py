@@ -28,8 +28,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 from pydantic import BaseModel
 import uvicorn
 
@@ -41,6 +44,7 @@ from scheduler import (
     resume_scheduler,
     shutdown_scheduler,
 )
+import db
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -90,7 +94,7 @@ LINKEDIN_CONFIG_FILES: List[str] = [
 # ---------------------------------------------------------------------------
 # Process Tracking
 # ---------------------------------------------------------------------------
-# Maps platform_id -> {"process": Popen, "start_time": float, "log_file": IO}
+# Maps process_key (e.g. email_platform_id) -> {"process": Popen, "start_time": float, "log_file": IO}
 platform_processes: Dict[str, Dict[str, Any]] = {}
 
 # Legacy aliases — kept so old endpoints work without any special-casing
@@ -100,6 +104,42 @@ RESULTS_PATH = Path("output/results.json")
 
 # Ensure output directory exists
 Path("output").mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Dynamic multi-user modes and security
+# ---------------------------------------------------------------------------
+USERS_MODE = os.getenv("USERS", "2")  # default to "2"
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+ALLOWED_EMAILS = [e.strip() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()]
+
+security = HTTPBearer(auto_error=False)
+
+def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
+    """Verify the Google ID token and return user email if authentication is enabled."""
+    if USERS_MODE == "1":
+        return "local_user"
+        
+    if not GOOGLE_CLIENT_ID:
+        # Multi-user mode is active but GOOGLE_CLIENT_ID is not configured in env
+        # Fallback to local_user to prevent locking out developer local testing
+        return "local_user"
+        
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authentication token required.")
+        
+    token = credentials.credentials
+    try:
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        email = idinfo.get("email")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token payload: email missing.")
+            
+        if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+            raise HTTPException(status_code=403, detail=f"Access denied: email {email} is not in the allowed list.")
+            
+        return email
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid Google ID token: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +169,11 @@ class SchedulerConfigModel(BaseModel):
 async def lifespan(app: FastAPI):
     """FastAPI lifespan handler — startup & shutdown logic."""
     # ---- STARTUP ----
+    logger.info("Initializing database…")
+    if USERS_MODE == "2":
+        db.init_db()
     logger.info("Initializing scheduler…")
-    init_scheduler(start_platform_bot)
+    init_scheduler(scheduler_start_callback)
     logger.info("Scheduler ready.")
 
     yield  # Application is running
@@ -140,12 +183,12 @@ async def lifespan(app: FastAPI):
     shutdown_scheduler()
 
     # Kill any running bot subprocesses
-    for pid, info in list(platform_processes.items()):
+    for key, info in list(platform_processes.items()):
         proc: subprocess.Popen = info.get("process")
         if proc and proc.poll() is None:
             try:
                 proc.kill()
-                logger.info("Killed lingering process for %s (PID %s)", pid, proc.pid)
+                logger.info("Killed lingering process for %s (PID %s)", key, proc.pid)
             except Exception:
                 pass
     logger.info("Backend shut down cleanly.")
@@ -441,35 +484,79 @@ def _find_python_exe() -> str:
     return python_exe
 
 
-def start_platform_bot(platform_id: str) -> Dict[str, Any]:
+def get_platform_paths(platform_id: str, email: str = "local_user") -> Dict[str, Path]:
+    """Get the isolated log and results paths for a user/platform combination."""
+    if USERS_MODE == "1" or email == "local_user":
+        return {
+            "log_path": Path(PLATFORMS[platform_id]["log_path"]),
+            "results_path": Path(PLATFORMS[platform_id]["results_path"])
+        }
+    
+    # Isolate paths for the user
+    if platform_id == "naukri":
+        user_dir = Path("output") / email
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "log_path": user_dir / "bot.log",
+            "results_path": user_dir / "results.json"
+        }
+    else:
+        # linkedin
+        user_dir = Path("linkedin") / "logs" / email
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "log_path": user_dir / "log.txt",
+            "results_path": Path("linkedin") / "all excels" / f"{email}_all_applied_applications_history.csv"
+        }
+
+
+def scheduler_start_callback(platform_id: str) -> Dict[str, Any]:
+    """Callback for scheduled runs. Executes platform bot for all registered SQLite users sequentially in USERS=2."""
+    if USERS_MODE == "1":
+        return start_platform_bot(platform_id, "local_user")
+    else:
+        import sqlite3
+        conn = sqlite3.connect("naukri_users.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT email FROM user_profiles")
+        emails = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if not emails:
+            logger.info("No registered users found in SQLite for scheduler run.")
+            return {"status": "skipped", "message": "No users found in database."}
+            
+        results = {}
+        for email in emails:
+            logger.info("Scheduler launching %s for %s", platform_id, email)
+            res = start_platform_bot(platform_id, email)
+            results[email] = res
+            time.sleep(5)  # brief sleep to stagger browser launches
+        return {"status": "started", "multi_results": results}
+
+
+def start_platform_bot(platform_id: str, email: str = "local_user") -> Dict[str, Any]:
     """
     Start a platform's bot subprocess.
-
-    This function is used BOTH by the HTTP endpoints and by the scheduler
-    callback, ensuring a single code-path for launching bots.
-
-    Args:
-        platform_id: Key from the PLATFORMS registry (e.g. "naukri", "linkedin").
-
-    Returns:
-        A dict with "status" and optional "pid" / "message".
     """
     if platform_id not in PLATFORMS:
         return {"status": "error", "message": f"Unknown platform: {platform_id}"}
 
     platform = PLATFORMS[platform_id]
+    process_key = f"{email}_{platform_id}"
 
     # Check if already running
-    if platform_id in platform_processes:
-        proc_info = platform_processes[platform_id]
+    if process_key in platform_processes:
+        proc_info = platform_processes[process_key]
         proc: subprocess.Popen = proc_info["process"]
         if proc.poll() is None:
             return {"status": "already_running", "message": f"{platform['name']} bot is already running."}
         else:
             # Clean up finished process
-            _cleanup_process(platform_id)
+            _cleanup_process(platform_id, email)
 
-    log_path = Path(platform["log_path"])
+    paths = get_platform_paths(platform_id, email)
+    log_path = paths["log_path"]
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Clear previous logs for a clean run
@@ -491,21 +578,33 @@ def start_platform_bot(platform_id: str) -> Dict[str, Any]:
         if sys.platform == "win32":
             creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+        # Prepare user environment variables
+        if USERS_MODE == "1":
+            user_settings = load_env_dict()
+        else:
+            user_settings = db.get_user_settings(email)
+
+        user_env = os.environ.copy()
+        user_env.update(user_settings)
+        if platform_id == "naukri":
+            user_env["OUTPUT_DIR"] = str(Path("output") / email)
+
         proc = subprocess.Popen(
             cmd,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=str(cwd),
             creationflags=creation_flags,
+            env=user_env,
         )
 
-        platform_processes[platform_id] = {
+        platform_processes[process_key] = {
             "process": proc,
             "start_time": time.time(),
             "log_file": log_file,
         }
 
-        logger.info("Started %s bot (PID %s)", platform["name"], proc.pid)
+        logger.info("Started %s bot for %s (PID %s)", platform["name"], email, proc.pid)
         return {
             "status": "started",
             "message": f"{platform['name']} bot started successfully.",
@@ -513,33 +612,28 @@ def start_platform_bot(platform_id: str) -> Dict[str, Any]:
         }
 
     except Exception as exc:
-        logger.error("Failed to start %s bot: %s", platform["name"], exc)
+        logger.error("Failed to start %s bot for %s: %s", platform["name"], email, exc)
         return {"status": "error", "message": f"Failed to start {platform['name']} bot: {exc}"}
 
 
-def stop_platform_bot(platform_id: str) -> Dict[str, Any]:
+def stop_platform_bot(platform_id: str, email: str = "local_user") -> Dict[str, Any]:
     """
     Stop a platform's bot subprocess.
-
-    Args:
-        platform_id: Key from the PLATFORMS registry.
-
-    Returns:
-        A dict with "status" and "message".
     """
     if platform_id not in PLATFORMS:
         return {"status": "error", "message": f"Unknown platform: {platform_id}"}
 
     platform = PLATFORMS[platform_id]
+    process_key = f"{email}_{platform_id}"
 
-    if platform_id not in platform_processes:
+    if process_key not in platform_processes:
         return {"status": "not_running", "message": f"{platform['name']} bot is not running."}
 
-    proc_info = platform_processes[platform_id]
+    proc_info = platform_processes[process_key]
     proc: subprocess.Popen = proc_info["process"]
 
     if proc.poll() is not None:
-        _cleanup_process(platform_id)
+        _cleanup_process(platform_id, email)
         return {"status": "not_running", "message": f"{platform['name']} bot is not running."}
 
     try:
@@ -559,23 +653,23 @@ def stop_platform_bot(platform_id: str) -> Dict[str, Any]:
         if proc.poll() is None:
             proc.kill()
 
-        _cleanup_process(platform_id)
+        _cleanup_process(platform_id, email)
         return {"status": "stopped", "message": f"{platform['name']} bot stopped successfully."}
 
     except Exception as exc:
-        # Last-resort force kill
         try:
             proc.kill()
-            _cleanup_process(platform_id)
+            _cleanup_process(platform_id, email)
             return {"status": "force_stopped", "message": f"{platform['name']} bot force killed. Error: {exc}"}
         except Exception as err:
             return {"status": "error", "message": f"Failed to terminate {platform['name']} bot: {err}"}
 
 
-def _cleanup_process(platform_id: str) -> None:
+def _cleanup_process(platform_id: str, email: str = "local_user") -> None:
     """Clean up tracking state for a finished / killed process."""
-    if platform_id in platform_processes:
-        info = platform_processes.pop(platform_id)
+    process_key = f"{email}_{platform_id}"
+    if process_key in platform_processes:
+        info = platform_processes.pop(process_key)
         log_file = info.get("log_file")
         if log_file and not log_file.closed:
             try:
@@ -584,14 +678,15 @@ def _cleanup_process(platform_id: str) -> None:
                 pass
 
 
-def _get_platform_running_status(platform_id: str) -> Dict[str, Any]:
+def _get_platform_running_status(platform_id: str, email: str = "local_user") -> Dict[str, Any]:
     """Return running/elapsed/pid info for a platform subprocess."""
     is_running = False
     pid = None
     elapsed = 0.0
 
-    if platform_id in platform_processes:
-        info = platform_processes[platform_id]
+    process_key = f"{email}_{platform_id}"
+    if process_key in platform_processes:
+        info = platform_processes[process_key]
         proc: subprocess.Popen = info["process"]
         if proc.poll() is None:
             is_running = True
@@ -600,7 +695,7 @@ def _get_platform_running_status(platform_id: str) -> Dict[str, Any]:
             if start_t:
                 elapsed = time.time() - start_t
         else:
-            _cleanup_process(platform_id)
+            _cleanup_process(platform_id, email)
 
     return {"running": is_running, "pid": pid, "elapsed_seconds": int(elapsed)}
 
@@ -609,48 +704,73 @@ def _get_platform_running_status(platform_id: str) -> Dict[str, Any]:
 #  API — Platforms overview
 # ========================================================================
 
+# ========================================================================
+#  API — Platforms overview
+# ========================================================================
+
 @app.get("/api/platforms")
-def get_platforms():
+def get_platforms(email: str = Depends(get_current_user)):
     """
     Return the platform registry enriched with live running status.
-
-    Each platform dict gains a "running" boolean and "pid" / "elapsed_seconds".
     """
     result: Dict[str, Any] = {}
     for pid, pinfo in PLATFORMS.items():
         entry = dict(pinfo)
-        entry.update(_get_platform_running_status(pid))
+        entry.update(_get_platform_running_status(pid, email))
         result[pid] = entry
     return result
 
 
 # ========================================================================
-#  API — Naukri endpoints (UNCHANGED behaviour)
+#  API — Auth config (New endpoint)
+# ========================================================================
+
+@app.get("/api/auth-config")
+def get_auth_config():
+    """Retrieve Google Auth configurations."""
+    return {
+        "users_mode": USERS_MODE,
+        "google_client_id": GOOGLE_CLIENT_ID,
+        "auth_enabled": USERS_MODE == "2" and bool(GOOGLE_CLIENT_ID),
+    }
+
+
+# ========================================================================
+#  API — Naukri endpoints (UNCHANGED behaviour in single-user mode)
 # ========================================================================
 
 @app.get("/api/config")
-def get_config():
-    """Retrieve all current Naukri bot configuration parameters from .env."""
+def get_config(email: str = Depends(get_current_user)):
+    """Retrieve all current Naukri bot configuration parameters."""
     try:
-        return load_env_dict()
+        if USERS_MODE == "1":
+            return load_env_dict()
+        else:
+            return db.get_user_settings(email)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read environment configuration: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to read configuration: {exc}")
 
 
 @app.post("/api/config")
-def update_config(data: ConfigModel):
-    """Update Naukri bot configuration parameters in .env."""
+def update_config(data: ConfigModel, email: str = Depends(get_current_user)):
+    """Update Naukri bot configuration parameters."""
     try:
-        save_env_dict(data.settings)
+        if USERS_MODE == "1":
+            save_env_dict(data.settings)
+        else:
+            db.save_user_settings(email, data.settings)
         return {"status": "success", "message": "Configuration saved successfully."}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to save environment configuration: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to save configuration: {exc}")
 
 
 @app.get("/api/status")
-def get_status():
+def get_status(email: str = Depends(get_current_user)):
     """Get the current running status and metrics of the Naukri bot."""
-    status = _get_platform_running_status("naukri")
+    status = _get_platform_running_status("naukri", email)
+    paths = get_platform_paths("naukri", email)
+    log_path = paths["log_path"]
+    results_path = paths["results_path"]
 
     # Calculate stats from results file
     stats: Dict[str, Any] = {
@@ -663,9 +783,9 @@ def get_status():
         "quota_hit": False,
     }
 
-    if RESULTS_PATH.exists():
+    if results_path.exists():
         try:
-            with open(RESULTS_PATH, "r", encoding="utf-8") as fh:
+            with open(results_path, "r", encoding="utf-8") as fh:
                 results = json.load(fh)
                 if isinstance(results, list):
                     stats["total"] = len(results)
@@ -685,9 +805,9 @@ def get_status():
             pass
 
     # Check for quota in logs
-    if LOG_PATH.exists():
+    if log_path.exists():
         try:
-            with open(LOG_PATH, "r", encoding="utf-8") as fh:
+            with open(log_path, "r", encoding="utf-8") as fh:
                 log_content = fh.read()
                 if "quota" in log_content.lower() or "limit has been reached" in log_content.lower():
                     stats["quota_hit"] = True
@@ -703,9 +823,9 @@ def get_status():
 
 
 @app.post("/api/start")
-def start_bot():
-    """Start the Naukri bot subprocess (backward-compatible endpoint)."""
-    result = start_platform_bot("naukri")
+def start_bot(email: str = Depends(get_current_user)):
+    """Start the Naukri bot subprocess."""
+    result = start_platform_bot("naukri", email)
 
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result["message"])
@@ -714,9 +834,9 @@ def start_bot():
 
 
 @app.post("/api/stop")
-def stop_bot():
-    """Stop the Naukri bot subprocess (backward-compatible endpoint)."""
-    result = stop_platform_bot("naukri")
+def stop_bot(email: str = Depends(get_current_user)):
+    """Stop the Naukri bot subprocess."""
+    result = stop_platform_bot("naukri", email)
 
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result["message"])
@@ -725,13 +845,16 @@ def stop_bot():
 
 
 @app.get("/api/logs")
-def get_logs(lines: int = 150):
+def get_logs(lines: int = 150, email: str = Depends(get_current_user)):
     """Retrieve the last N lines of Naukri execution logs."""
-    if not LOG_PATH.exists():
+    paths = get_platform_paths("naukri", email)
+    log_path = paths["log_path"]
+    
+    if not log_path.exists():
         return {"logs": "No logs recorded yet. Start the bot to generate logs."}
 
     try:
-        with open(LOG_PATH, "r", encoding="utf-8") as fh:
+        with open(log_path, "r", encoding="utf-8") as fh:
             log_lines = fh.readlines()
             last_lines = log_lines[-lines:] if len(log_lines) > lines else log_lines
             return {"logs": "".join(last_lines)}
@@ -740,13 +863,16 @@ def get_logs(lines: int = 150):
 
 
 @app.get("/api/results")
-def get_results():
+def get_results(email: str = Depends(get_current_user)):
     """Retrieve all Naukri job-application results."""
-    if not RESULTS_PATH.exists():
+    paths = get_platform_paths("naukri", email)
+    results_path = paths["results_path"]
+    
+    if not results_path.exists():
         return []
 
     try:
-        with open(RESULTS_PATH, "r", encoding="utf-8") as fh:
+        with open(results_path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return []
@@ -756,13 +882,14 @@ def get_results():
 #  API — LinkedIn endpoints
 # ========================================================================
 
+# ========================================================================
+#  API — LinkedIn endpoints
+# ========================================================================
+
 @app.get("/api/linkedin/config")
-def get_linkedin_config():
+def get_linkedin_config(email: str = Depends(get_current_user)):
     """
     Read LinkedIn configuration from all 6 Python config files.
-
-    Returns a dict keyed by config-file group (personals, questions,
-    resume, search, secrets, settings) with nested variable dicts.
     """
     try:
         return read_all_linkedin_configs()
@@ -771,12 +898,9 @@ def get_linkedin_config():
 
 
 @app.post("/api/linkedin/config")
-def update_linkedin_config(data: LinkedInConfigModel):
+def update_linkedin_config(data: LinkedInConfigModel, email: str = Depends(get_current_user)):
     """
     Update LinkedIn configuration.
-
-    Accepts a dict like:
-        {"settings": {"personals": {"first_name": "Aditya"}, ...}}
     """
     try:
         summary = write_linkedin_configs(data.settings)
@@ -790,11 +914,11 @@ def update_linkedin_config(data: LinkedInConfigModel):
 
 
 @app.get("/api/linkedin/status")
-def get_linkedin_status():
+def get_linkedin_status(email: str = Depends(get_current_user)):
     """
     Get the LinkedIn bot's running status and basic stats from the CSV.
     """
-    status = _get_platform_running_status("linkedin")
+    status = _get_platform_running_status("linkedin", email)
 
     # Compute stats from CSV
     csv_results = _parse_linkedin_results_csv()
@@ -812,27 +936,28 @@ def get_linkedin_status():
 
 
 @app.post("/api/linkedin/start")
-def start_linkedin_bot():
+def start_linkedin_bot(email: str = Depends(get_current_user)):
     """Start the LinkedIn bot subprocess."""
-    result = start_platform_bot("linkedin")
+    result = start_platform_bot("linkedin", email)
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result["message"])
     return result
 
 
 @app.post("/api/linkedin/stop")
-def stop_linkedin_bot():
+def stop_linkedin_bot(email: str = Depends(get_current_user)):
     """Stop the LinkedIn bot subprocess."""
-    result = stop_platform_bot("linkedin")
+    result = stop_platform_bot("linkedin", email)
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result["message"])
     return result
 
 
 @app.get("/api/linkedin/logs")
-def get_linkedin_logs(lines: int = 150):
+def get_linkedin_logs(lines: int = 150, email: str = Depends(get_current_user)):
     """Retrieve the last N lines of LinkedIn bot execution logs."""
-    log_path = Path(PLATFORMS["linkedin"]["log_path"])
+    paths = get_platform_paths("linkedin", email)
+    log_path = paths["log_path"]
     if not log_path.exists():
         return {"logs": "No LinkedIn logs recorded yet. Start the LinkedIn bot to generate logs."}
 
@@ -846,12 +971,9 @@ def get_linkedin_logs(lines: int = 150):
 
 
 @app.get("/api/linkedin/results")
-def get_linkedin_results():
+def get_linkedin_results(email: str = Depends(get_current_user)):
     """
     Parse the LinkedIn application-history CSV and return as a JSON array.
-
-    Columns: Job_ID, Date_Applied, Title, Company, HR_Name, HR_Link,
-    Job_Link, External_Job_link
     """
     try:
         return _parse_linkedin_results_csv()
@@ -863,8 +985,12 @@ def get_linkedin_results():
 #  API — Scheduler endpoints
 # ========================================================================
 
+# ========================================================================
+#  API — Scheduler endpoints
+# ========================================================================
+
 @app.get("/api/scheduler/status")
-def api_scheduler_status():
+def api_scheduler_status(email: str = Depends(get_current_user)):
     """Return the current scheduler status."""
     try:
         return get_scheduler_status()
@@ -873,11 +999,9 @@ def api_scheduler_status():
 
 
 @app.post("/api/scheduler/config")
-def api_scheduler_config(data: SchedulerConfigModel):
+def api_scheduler_config(data: SchedulerConfigModel, email: str = Depends(get_current_user)):
     """
     Update the scheduler configuration.
-
-    Accepts optional schedule_time (HH:MM) and enabled_platforms list.
     """
     try:
         result = update_scheduler_config(
@@ -890,7 +1014,7 @@ def api_scheduler_config(data: SchedulerConfigModel):
 
 
 @app.post("/api/scheduler/pause")
-def api_scheduler_pause():
+def api_scheduler_pause(email: str = Depends(get_current_user)):
     """Pause the scheduler (the daily job will skip execution)."""
     try:
         return pause_scheduler()
@@ -899,7 +1023,7 @@ def api_scheduler_pause():
 
 
 @app.post("/api/scheduler/resume")
-def api_scheduler_resume():
+def api_scheduler_resume(email: str = Depends(get_current_user)):
     """Resume the scheduler."""
     try:
         return resume_scheduler()

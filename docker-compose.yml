@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  naukri-backend:
+    build: .
+    container_name: naukri-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./output:/app/output
+      - ./naukri_users.db:/app/naukri_users.db
+      - ./service_account.json:/app/service_account.json:ro
+      - .env:/app/.env
+    restart: always
