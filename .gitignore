@@ -1,0 +1,12 @@
+.env
+service_account.json
+venv/
+__pycache__/
+*.pyc
+output/
+logs/
+.venv/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+

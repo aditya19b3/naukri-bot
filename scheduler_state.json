@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "paused": false,
+  "schedule_time": "09:00",
+  "timezone": "Asia/Kolkata",
+  "enabled_platforms": [
+    "naukri",
+    "linkedin"
+  ],
+  "last_run_time": null,
+  "last_run_results": {}
+}
