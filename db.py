@@ -4,12 +4,13 @@ import logging
 from pathlib import Path
 from typing import Dict
 
-DB_PATH = Path("naukri_users.db")
+DB_PATH = Path("output/naukri_users.db")
 EXAMPLE_ENV_PATH = Path(".env.example")
 logger = logging.getLogger("db")
 
 def init_db():
     """Initialize the SQLite database and create the user_profiles table if it doesn't exist."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
